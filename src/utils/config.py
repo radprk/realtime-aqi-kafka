@@ -71,6 +71,20 @@ LOGGING_CONFIG = {
     "log_dir": DATA_DIR / "logs"
 }
 
+DATA_CONFIG = {
+    "raw_data_path": DATA_DIR / "raw" / "AirQualityUCI.csv",
+    "processed_data_path": DATA_DIR / "processed" / "processed_air_quality_data.csv",
+    "feature_columns": [
+        "PT08.S1(CO)", "NMHC(GT)", "C6H6(GT)", "PT08.S2(NMHC)",
+        "NOx(GT)", "PT08.S3(NOx)", "NO2(GT)", "PT08.S4(NO2)",
+        "PT08.S5(O3)", "T", "RH", "AH"
+    ],
+    "target_column": "CO(GT)",
+    "date_column": "DateTime",
+    "time_column": "Time",
+    "api_output_path": "data/api_output.csv"
+}
+
 def get_config(section: str) -> Dict[str, Any]:
     """
     Get configuration for a specific section.
