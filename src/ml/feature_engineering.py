@@ -48,7 +48,7 @@ class AirQualityFeatureEngineer:
         if 'DateTime' in df_features.columns:
             df_features['DateTime'] = pd.to_datetime(df_features['DateTime'], errors='coerce')
             if df_features['DateTime'].isna().any():
-                df_features['DateTime'].fillna(pd.Timestamp.now(), inplace=True)
+                df_features['DateTime'] = df_features['DateTime'].fillna(pd.Timestamp.now())
         else:
             raise ValueError("DateTime column not found in DataFrame")
         
@@ -60,7 +60,15 @@ class AirQualityFeatureEngineer:
         df_features['quarter'] = df_features['DateTime'].dt.quarter
         df_features['is_weekend'] = df_features['dayofweek'].isin([5, 6]).astype(int)
         
-        # ... rest of the method remains the same
+        # Cyclical features
+        df_features['hour_sin'] = np.sin(2 * np.pi * df_features['hour'] / 24)
+        df_features['hour_cos'] = np.cos(2 * np.pi * df_features['hour'] / 24)
+        df_features['month_sin'] = np.sin(2 * np.pi * df_features['month'] / 12)
+        df_features['month_cos'] = np.cos(2 * np.pi * df_features['month'] / 12)
+        
+        logger.info(f"Created temporal features. New shape: {df_features.shape}")
+        
+        return df_features
     
     def create_lag_features(self, df: pd.DataFrame, target_col: str, lags: List[int] = [1, 3, 6, 12, 24]) -> pd.DataFrame:
         """
@@ -180,8 +188,11 @@ class AirQualityFeatureEngineer:
         """
         logger.info(f"Removing features with correlation > {threshold}")
         
+        # Select only numeric columns
+        numeric_df = df.select_dtypes(include=[np.number])
+        
         # Calculate correlation matrix
-        corr_matrix = df.corr().abs()
+        corr_matrix = numeric_df.corr().abs()
         
         # Select upper triangle of correlation matrix
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
@@ -242,8 +253,10 @@ class AirQualityFeatureEngineer:
         # Handle multicollinearity
         df_features = self.handle_multicollinearity(df_features)
         
-        # Select final features
-        self.feature_names = [col for col in df_features.columns if col not in ['Date', 'Time', 'DateTime', target_col]]
+        # Select final features (excluding non-numeric columns)
+        self.feature_names = [col for col in df_features.columns 
+                             if col not in ['Date', 'Time', 'DateTime', target_col] 
+                             and pd.api.types.is_numeric_dtype(df_features[col])]
         
         logger.info(f"Feature engineering complete. Total features: {len(self.feature_names)}")
         
@@ -261,46 +274,71 @@ class AirQualityFeatureEngineer:
         """Inverse transform scaled features."""
         return self.scaler.inverse_transform(X_scaled)
     
-    # Update the prepare_single_prediction method in AirQualityFeatureEngineer class
-
-    def prepare_single_prediction(self, data: Dict) -> pd.DataFrame:
-        """Prepare a single data point for prediction."""
+    def prepare_single_prediction(self, data: Dict, use_historical_data=False) -> pd.DataFrame:
+        """
+        Prepare a single data point for prediction.
+        
+        Args:
+            data: Dictionary with raw sensor values
+            use_historical_data: If True, use actual historical data for lag/rolling features
+                                If False, use placeholder values (for realtime predictions)
+        """
         df = pd.DataFrame([data])
         
         # Ensure DateTime is properly converted
         if 'DateTime' in df.columns:
             df['DateTime'] = pd.to_datetime(df['DateTime'], errors='coerce')
-            # If conversion fails, use current time
             if df['DateTime'].isna().any():
                 df['DateTime'] = pd.Timestamp.now()
         else:
-            # If no DateTime column, use current time
             df['DateTime'] = pd.Timestamp.now()
         
-        # Now we can safely use .dt accessor
+        # Create temporal features
         df = self.create_temporal_features(df)
         
-        # For single predictions, we set lag and rolling features to the current value
         target_col = self.data_config["target_column"]
-        if target_col in df.columns:
-            current_value = df[target_col].iloc[0]
-            
-            # Add lag features
-            for lag in [1, 3, 6, 12, 24]:
-                df[f'{target_col}_lag_{lag}'] = current_value
-            
-            # Add rolling features
-            for window in [3, 6, 12, 24]:
-                df[f'{target_col}_rolling_mean_{window}'] = current_value
-                df[f'{target_col}_rolling_std_{window}'] = 0
-                df[f'{target_col}_rolling_min_{window}'] = current_value
-                df[f'{target_col}_rolling_max_{window}'] = current_value
-            
-            # Add EMA features
-            for alpha in [0.1, 0.3, 0.5, 0.7, 0.9]:
-                df[f'{target_col}_ema_{alpha}'] = current_value
         
-        # Create interaction features if possible
+        if use_historical_data and self.historical_data is not None:
+            # Use actual historical data for lag and rolling features
+            # This is more accurate for offline evaluation
+            current_time = df['DateTime'].iloc[0]
+            
+            # Get historical data up to this timestamp
+            hist_data = self.historical_data[self.historical_data['DateTime'] < current_time]
+            hist_data = hist_data.tail(100)  # Use last 100 records for features
+            
+            # Combine historical data with current point
+            combined_df = pd.concat([hist_data, df], ignore_index=True)
+            
+            # Create lag and rolling features on combined data
+            combined_df = self.create_lag_features(combined_df, target_col)
+            combined_df = self.create_rolling_features(combined_df, target_col)
+            combined_df = self.create_exponential_features(combined_df, target_col)
+            
+            # Extract just the last row (our prediction point)
+            df = combined_df.iloc[[-1]].copy()
+        else:
+            # For realtime predictions without historical data
+            # Use placeholder values (this is what's causing the poor performance)
+            if target_col in df.columns:
+                current_value = df[target_col].iloc[0]
+                
+                # Add lag features
+                for lag in [1, 3, 6, 12, 24]:
+                    df[f'{target_col}_lag_{lag}'] = current_value * 0.95  # Slight variation
+                
+                # Add rolling features
+                for window in [3, 6, 12, 24]:
+                    df[f'{target_col}_rolling_mean_{window}'] = current_value
+                    df[f'{target_col}_rolling_std_{window}'] = current_value * 0.1  # Realistic std
+                    df[f'{target_col}_rolling_min_{window}'] = current_value * 0.9
+                    df[f'{target_col}_rolling_max_{window}'] = current_value * 1.1
+                
+                # Add EMA features
+                for alpha in [0.1, 0.3, 0.5, 0.7, 0.9]:
+                    df[f'{target_col}_ema_{alpha}'] = current_value * (1 - alpha * 0.05)
+            
+        # Create interaction features
         pollutant_cols = ['PT08.S1(CO)', 'PT08.S2(NMHC)', 'PT08.S3(NOx)', 
                         'PT08.S4(NO2)', 'PT08.S5(O3)']
         

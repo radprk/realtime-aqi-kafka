@@ -27,6 +27,9 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from src.utils.logger import setup_logger
 from src.utils.config import get_config
 
+# Import feature engineering from the same directory
+from feature_engineering import AirQualityFeatureEngineer
+
 logger = setup_logger("ml_training")
 
 class AirQualityModelTrainer:
@@ -41,6 +44,9 @@ class AirQualityModelTrainer:
         # Set up MLflow
         mlflow.set_tracking_uri(self.mlflow_config["tracking_uri"])
         mlflow.set_experiment(self.mlflow_config["experiment_name"])
+        
+        # Initialize feature engineer
+        self.feature_engineer = AirQualityFeatureEngineer()
         
     def load_data(self) -> pd.DataFrame:
         """Load and preprocess the data."""
@@ -100,9 +106,9 @@ class AirQualityModelTrainer:
         for col in numeric_columns:
             if col in df_clean.columns:
                 # Forward fill first
-                df_clean[col] = df_clean[col].fillna(method='ffill')
+                df_clean[col] = df_clean[col].ffill()
                 # Then backward fill
-                df_clean[col] = df_clean[col].fillna(method='bfill')
+                df_clean[col] = df_clean[col].bfill()
                 # Fill any remaining with mean
                 if df_clean[col].isna().any():
                     df_clean[col] = df_clean[col].fillna(df_clean[col].mean())
@@ -113,81 +119,17 @@ class AirQualityModelTrainer:
         logger.info(f"Preprocessing complete. Shape: {df_clean.shape}")
         return df_clean
     
-    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create features including temporal and lag features."""
-        logger.info("Creating features...")
-        
-        if "DateTime" in df.columns:
-            df["DateTime"] = pd.to_datetime(df["DateTime"], errors='coerce')
-            
-        df_features = df.copy()
-        
-        # Ensure DateTime is in the correct format
-        if 'DateTime' not in df_features.columns:
-            logger.error("DateTime column missing")
-            return df_features
-
-        
-        # Temporal features
-        df_features['hour'] = df_features['DateTime'].dt.hour
-        df_features['day'] = df_features['DateTime'].dt.day
-        df_features['month'] = df_features['DateTime'].dt.month
-        df_features['dayofweek'] = df_features['DateTime'].dt.dayofweek
-        
-        # Lag features for the target
-        target_col = self.data_config["target_column"]
-        
-        # Ensure target column is numeric
-        if target_col in df_features.columns:
-            df_features[target_col] = pd.to_numeric(df_features[target_col], errors='coerce')
-            
-            for lag in [1, 3, 6, 12, 24]:
-                df_features[f'{target_col}_lag_{lag}'] = df_features[target_col].shift(lag)
-            
-            # Rolling features
-            windows = [3, 6, 12, 24]
-            for window in windows:
-                df_features[f'{target_col}_rolling_mean_{window}'] = (
-                    df_features[target_col].rolling(window=window, min_periods=1).mean()
-                )
-                df_features[f'{target_col}_rolling_std_{window}'] = (
-                    df_features[target_col].rolling(window=window, min_periods=1).std()
-                )
-            
-            # Fill NaN values in rolling std with 0
-            for col in df_features.columns:
-                if 'rolling_std' in col:
-                    df_features[col] = df_features[col].fillna(0)
-        
-        # Drop rows with NaN values in lag features
-        initial_rows = len(df_features)
-        df_features = df_features.dropna()
-        
-        logger.info(f"Dropped {initial_rows - len(df_features)} rows with NaN values")
-        logger.info(f"Features created. Shape: {df_features.shape}")
-        
-        return df_features
-    
     def prepare_data(self, df: pd.DataFrame):
-        """Prepare data for training."""
+        """Prepare data for training using feature engineering module."""
         logger.info("Preparing data for training...")
         
-        # Select features
-        feature_cols = self.data_config["feature_columns"] + [
-            'hour', 'day', 'month', 'dayofweek'
-        ] + [
-            f'{self.data_config["target_column"]}_lag_{lag}' for lag in [1, 3, 6, 12, 24]
-        ] + [
-            f'{self.data_config["target_column"]}_rolling_mean_{window}' for window in [3, 6, 12, 24]
-        ] + [
-            f'{self.data_config["target_column"]}_rolling_std_{window}' for window in [3, 6, 12, 24]
-        ]
+        # Apply feature engineering
+        df_features = self.feature_engineer.transform(df)
         
-        # Filter only columns that exist
-        available_features = [col for col in feature_cols if col in df.columns]
-        
-        X = df[available_features]
-        y = df[self.data_config["target_column"]]
+        # Get target and features
+        target_col = self.data_config["target_column"]
+        X = df_features[self.feature_engineer.feature_names]
+        y = df_features[target_col]
         
         # Ensure all data is numeric
         X = X.apply(pd.to_numeric, errors='coerce')
@@ -206,14 +148,14 @@ class AirQualityModelTrainer:
             shuffle=False  # Time series data
         )
         
-        # Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
+        # Scale features using feature engineer's scaler
+        self.feature_engineer.fit_scaler(X_train)
+        X_train_scaled = self.feature_engineer.scale_features(X_train)
+        X_test_scaled = self.feature_engineer.scale_features(X_test)
         
         logger.info(f"Data prepared. Train shape: {X_train.shape}, Test shape: {X_test.shape}")
         
-        return X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled, scaler
+        return X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled
     
     def train_linear_regression(self, X_train, X_test, y_train, y_test):
         """Train Linear Regression model."""
@@ -372,9 +314,9 @@ class AirQualityModelTrainer:
             
             return model, mae
     
-    def save_best_model(self, best_model, scaler):
-        """Save the best model locally."""
-        logger.info("Saving best model...")
+    def save_best_model(self, best_model, feature_engineer):
+        """Save the best model and feature engineer locally."""
+        logger.info("Saving best model and feature engineer...")
         
         model_dir = self.mlflow_config["artifact_path"]
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -384,22 +326,22 @@ class AirQualityModelTrainer:
         with open(model_path, 'wb') as f:
             pickle.dump(best_model, f)
         
-        # Save scaler
-        scaler_path = model_dir / "scaler.pkl"
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(scaler, f)
+        # Save feature engineer (which includes the scaler)
+        feature_engineer_path = model_dir / "feature_engineer.pkl"
+        with open(feature_engineer_path, 'wb') as f:
+            pickle.dump(feature_engineer, f)
         
         logger.info(f"Model saved to {model_path}")
+        logger.info(f"Feature engineer saved to {feature_engineer_path}")
     
     def train_all_models(self):
         """Train all models and select the best one."""
         # Load and preprocess data
         df = self.load_data()
         df_clean = self.preprocess_data(df)
-        df_features = self.create_features(df_clean)
         
-        # Prepare data
-        X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled, scaler = self.prepare_data(df_features)
+        # Prepare data with feature engineering
+        X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled = self.prepare_data(df_clean)
         
         # Train models
         models = {}
@@ -431,8 +373,8 @@ class AirQualityModelTrainer:
         
         logger.info(f"Best model: {best_model_name} with MAE: {metrics[best_model_name]:.4f}")
         
-        # Save best model
-        self.save_best_model(best_model, scaler)
+        # Save best model and feature engineer
+        self.save_best_model(best_model, self.feature_engineer)
         
         return best_model, best_model_name, metrics
 
